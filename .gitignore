@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+*.env
+
+# Runtime data files (contain real bet history)
+dry_run_log.jsonl
+resolved_bets.jsonl
+open_positions.json
+scan_state.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.Python
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Next.js
+ui/.next/
+ui/node_modules/
+ui/.env.local
+ui/.env*.local
+
+# Bot runtime data written to ui/data/ (generated, not source)
+ui/data/
