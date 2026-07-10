@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 from analyzer import TradeSignal
-from kalshi import get_token_id, place_order
+from kalshi import get_token_id, place_order, kalshi_fee
+
+
+def _entry_fee(stake: float, price: float) -> float:
+    """Kalshi fee actually paid to OPEN this position (sunk cost, booked now)."""
+    if price <= 0:
+        return 0.0
+    contracts = max(1, round(stake / price))
+    return round(kalshi_fee(price, contracts), 2)
 
 _DATA_DIR = Path("ui/data")
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,6 +56,9 @@ def _log_dry_run(signal: TradeSignal, note: str = "") -> None:
         "market_price": signal.market_price,
         "our_prob": signal.our_prob,
         "edge": signal.edge,
+        "fee": signal.fee,
+        "regime": signal.regime,
+        "strategy": signal.strategy,
         "stake_usdc": signal.kelly_stake,
         "forecast_city": signal.forecast.city,
         "forecast_high_f": signal.forecast.high_f,
@@ -86,6 +97,9 @@ def execute_dry_run(signal: TradeSignal, open_positions: dict, max_open: int) ->
         "resolution_source": signal.market.resolution_source,
         "description": signal.market.description,
         "target_date": signal.forecast.target_date.isoformat(),
+        "regime": signal.regime,
+        "strategy": signal.strategy,
+        "fee_usdc": _entry_fee(signal.kelly_stake, signal.market_price),
     }
     _save_positions(open_positions)
 
@@ -109,22 +123,39 @@ def execute_live(signal: TradeSignal, config: Any, open_positions: dict, max_ope
         return
 
     try:
-        side        = signal.outcome.lower()          # "yes" or "no"
-        price_cents = int(signal.market_price * 100)  # convert 0-1 to 1-99
-        contracts   = max(1, int(signal.kelly_stake / signal.market_price))
+        side = signal.outcome.lower()          # "yes" or "no"
+        # MAKER pricing: when the spread is wide, rest a limit 1¢ above the bid
+        # instead of crossing to the ask — better fill AND no taker fee. If it
+        # doesn't fill, main.py's order babysitter cancels + crosses next scan.
+        m = signal.market
+        bid = m.yes_bid if signal.outcome == "YES" else m.no_bid
+        ask = m.yes_ask if signal.outcome == "YES" else m.no_ask
+        maker = bool(bid and ask and (ask - bid) >= 0.03)
+        price = (bid + 0.01) if maker else signal.market_price
+        price_cents = max(1, min(99, round(price * 100)))
+        contracts = max(1, int(signal.kelly_stake / price))
         resp = place_order(config, signal.market.id, side, contracts, price_cents)
-        print(f"  [LIVE] Order placed: {signal.outcome} ${signal.kelly_stake:.2f} on "
-              f"'{signal.market.question[:60]}'")
-        print(f"         Response: {resp}")
+        order_id = (resp.get("order") or {}).get("order_id", "")
+        print(f"  [LIVE] {'MAKER' if maker else 'TAKER'} order: {signal.outcome} "
+              f"{contracts}x @ {price_cents}¢ on '{signal.market.question[:55]}'")
 
         open_positions[signal.market.id] = {
             "question": signal.market.question,
             "outcome": signal.outcome,
-            "market_price": signal.market_price,
+            "market_price": round(price, 4),
             "stake_usdc": signal.kelly_stake,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "end_date": signal.market.end_date,
-            "order_response": str(resp),
+            "resolution_source": signal.market.resolution_source,
+            "description": signal.market.description,
+            "target_date": signal.forecast.target_date.isoformat(),
+            "regime": signal.regime,
+            "strategy": signal.strategy,
+            "fee_usdc": 0.0 if maker else _entry_fee(signal.kelly_stake, price),
+            # order babysitting (main.py cancels + crosses if it doesn't fill)
+            "pending_order_id": order_id,
+            "pending_since": datetime.now(timezone.utc).isoformat(),
+            "pending_maker": maker,
         }
         _save_positions(open_positions)
 

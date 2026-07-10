@@ -56,6 +56,13 @@ def main():
     print(f"  Dashboard : http://localhost:3000")
     print(f"  Press Ctrl+C to stop.\n")
 
+    # Kill any stale bot from a previous run so we don't run old code alongside new
+    try:
+        subprocess.run(["pkill", "-f", "main.py --"], capture_output=True)
+        time.sleep(1)
+    except Exception:
+        pass
+
     # Check Node/npm available for UI
     npm = "npm"
     try:
@@ -64,7 +71,12 @@ def main():
         print("[PolyBot] npm not found — skipping UI. Run `python main.py --dry-run` manually.")
         npm = None
 
-    bot = subprocess.Popen([python, "main.py", bot_mode], cwd=root)
+    # Unbuffered so bot output shows up live even when piped to a log file
+    bot = subprocess.Popen(
+        [python, "main.py", bot_mode],
+        cwd=root,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
 
     if npm and ui_dir.exists():
         time.sleep(2)

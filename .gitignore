@@ -34,3 +34,4 @@ ui/.env*.local
 
 # Bot runtime data written to ui/data/ (generated, not source)
 ui/data/
+.backtest_cache

@@ -52,6 +52,7 @@ CITY_TO_ICAO: dict[str, str] = {
     "Portland":       "KPDX",
     "Nashville":      "KBNA",
     "Salt Lake City": "KSLC",
+    "Houston":        "KHOU",
     "Kansas City":    "KMCI",
     "Sacramento":     "KSMF",
     "Baltimore":      "KBWI",
@@ -76,6 +77,32 @@ CITY_TO_ICAO: dict[str, str] = {
     "Wichita":        "KICT",
     "Colorado Springs":"KCOS",
 }
+
+# Coarse climate region per city — used to cap CORRELATED exposure. Overnight
+# lows (and daytime highs) across nearby cities aren't independent: a single
+# ridge or heat dome moves them all the same direction at once, so N "NO on
+# the low" bets across one region are really one bet on the regional pattern,
+# not N diversified ones.
+CITY_REGION: dict[str, str] = {
+    "Los Angeles": "Pacific", "San Francisco": "Pacific", "San Diego": "Pacific",
+    "Seattle": "Pacific", "Portland": "Pacific", "Sacramento": "Pacific",
+    "Denver": "Southwest", "Phoenix": "Southwest", "Las Vegas": "Southwest",
+    "Salt Lake City": "Southwest", "El Paso": "Southwest", "Tucson": "Southwest",
+    "Albuquerque": "Southwest", "Colorado Springs": "Southwest",
+    "Chicago": "Midwest", "Minneapolis": "Midwest", "Kansas City": "Midwest",
+    "Milwaukee": "Midwest", "Indianapolis": "Midwest", "Columbus": "Midwest",
+    "Cleveland": "Midwest", "Detroit": "Midwest", "Omaha": "Midwest",
+    "Wichita": "Midwest", "Louisville": "Midwest",
+    "Dallas": "South", "Austin": "South", "San Antonio": "South",
+    "Houston": "South", "Oklahoma City": "South", "New Orleans": "South",
+    "Memphis": "South", "Nashville": "South",
+    "Atlanta": "Southeast", "Miami": "Southeast", "Tampa": "Southeast",
+    "Charlotte": "Southeast", "Raleigh": "Southeast", "Jacksonville": "Southeast",
+    "New York City": "Northeast", "Washington": "Northeast", "Philadelphia": "Northeast",
+    "Boston": "Northeast", "Baltimore": "Northeast", "Hartford": "Northeast",
+    "Buffalo": "Northeast", "Pittsburgh": "Northeast", "Richmond": "Northeast",
+}
+
 
 # Map Kalshi city abbreviations in series tickers to full city names
 _CITY_MAP = {
@@ -104,6 +131,11 @@ _CITY_MAP = {
     "SFO":   "San Francisco",
     "TSFO":  "San Francisco",
     "TSEA":  "Seattle",
+    "HOU":   "Houston",
+    "THOU":  "Houston",
+    "NY":    "New York City",
+    "NYD":   "New York City",
+    "NYC":   "New York City",
     "MIN":   "Minneapolis",
     "TMIN":  "Minneapolis",
     "NOLA":  "New Orleans",
@@ -131,6 +163,25 @@ class Market:
     resolution_source: str
     description: str
     raw: dict
+    # Liquidity fields — needed to avoid trading phantom-quote markets
+    yes_bid: float = 0.0
+    yes_ask: float = 0.0
+    no_bid: float = 0.0
+    no_ask: float = 0.0
+    last_price: float = 0.0
+    volume_24h: float = 0.0
+
+    def spread(self, outcome: str) -> float:
+        """Bid-ask spread for the given side (0-1). Large = illiquid/unreliable."""
+        if outcome == "YES":
+            return abs(self.yes_ask - self.yes_bid) if (self.yes_ask and self.yes_bid) else 1.0
+        return abs(self.no_ask - self.no_bid) if (self.no_ask and self.no_bid) else 1.0
+
+    def has_liquidity(self, outcome: str, max_spread: float) -> bool:
+        """True if this side has a real two-sided market we could actually trade."""
+        bid = self.yes_bid if outcome == "YES" else self.no_bid
+        ask = self.yes_ask if outcome == "YES" else self.no_ask
+        return bool(bid and ask) and (ask - bid) <= max_spread and self.volume_24h > 0
 
 
 def _parse_series_city(series_ticker: str) -> tuple[Optional[str], Optional[str]]:
@@ -262,15 +313,24 @@ def _market_from_dict(m: dict, kind: str, city: str) -> Optional[Market]:
         resolution_source=icao,   # ICAO code e.g. "KLAX" — used by weather.py and realtime.py
         description=m.get("rules_primary", ""),
         raw=m,
+        yes_bid=yes_bid or 0.0, yes_ask=yes_ask or 0.0,
+        no_bid=no_bid or 0.0,   no_ask=no_ask or 0.0,
+        last_price=last or 0.0,
+        volume_24h=float(m.get("volume_24h_fp", 0) or 0),
     )
 
 
-def fetch_weather_markets(config: Any = None, pages: int = 5) -> list[Market]:
-    """
-    Fetch open Kalshi weather markets. No authentication required for reads.
-    Pulls all Climate and Weather series, then fetches markets for each open event.
-    """
-    # Step 1: get all weather series
+# Cache the weather-series list — it changes ~never, and dropping the /series
+# + per-event /markets calls is most of the scan's HTTP round trips.
+_series_cache: list[tuple[str, str, str]] = []
+_series_cache_at: float = 0.0
+SERIES_TTL_S = 3600.0
+
+
+def _weather_series() -> list[tuple[str, str, str]]:
+    global _series_cache, _series_cache_at
+    if _series_cache and (time.time() - _series_cache_at) < SERIES_TTL_S:
+        return _series_cache
     try:
         r = requests.get(
             f"{BASE_URL}/series",
@@ -281,55 +341,136 @@ def fetch_weather_markets(config: Any = None, pages: int = 5) -> list[Market]:
         series_list = r.json().get("series", [])
     except Exception as exc:
         print(f"[kalshi] Could not fetch series: {exc}")
-        return []
+        return _series_cache   # stale is better than nothing
 
-    # Step 2: for each relevant series, get open events then markets
-    markets: list[Market] = []
-    seen: set[str] = set()
-
+    temp_series = []
     for s in series_list:
         ticker = s.get("ticker", "")
         kind, city = _parse_series_city(ticker)
-        if not kind or not city:
-            continue  # skip non-temp series (rain, hurricanes, etc.)
+        if kind and city:
+            temp_series.append((ticker, kind, city))
+    if temp_series:
+        _series_cache, _series_cache_at = temp_series, time.time()
+    return temp_series
 
-        # Fetch open events for this series
+
+def _get_retry(url, params, tries=3):
+    """GET with backoff on rate-limit (429) or transient errors."""
+    for i in range(tries):
         try:
-            ev_resp = requests.get(
-                f"{BASE_URL}/events",
-                params={"series_ticker": ticker, "status": "open", "limit": 10},
-                timeout=10,
-            )
-            ev_resp.raise_for_status()
-            events = ev_resp.json().get("events", [])
-        except Exception:
-            continue
-
-        for event in events:
-            event_ticker = event.get("event_ticker", "")
-
-            # Fetch markets for this event
-            try:
-                mk_resp = requests.get(
-                    f"{BASE_URL}/markets",
-                    params={"event_ticker": event_ticker, "limit": 20},
-                    timeout=10,
-                )
-                mk_resp.raise_for_status()
-                event_markets = mk_resp.json().get("markets", [])
-            except Exception:
+            r = requests.get(url, params=params, timeout=12)
+            if r.status_code == 429:
+                time.sleep(0.3 * (i + 1))
                 continue
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            time.sleep(0.2 * (i + 1))
+    return None
 
-            for m in event_markets:
-                m_ticker = m.get("ticker", "")
-                if m_ticker in seen or m.get("status") != "active":
+
+# Discovery cache: market ticker → (kind, city). The SET of open markets only
+# changes when Kalshi lists new daily events, so rediscover every 5 min; in
+# between, refresh PRICES for known tickers via batched /markets?tickers=
+# calls (3-4 requests instead of ~80 per-series /events requests).
+_discovery: dict[str, tuple[str, str]] = {}
+_discovery_at: float = 0.0
+DISCOVERY_TTL_S = 300.0
+
+
+def fetch_weather_markets(config: Any = None, pages: int = 5) -> list[Market]:
+    """
+    Fetch open Kalshi weather markets. No authentication required for reads.
+
+    Fast path (~1s): batched price refresh for the known ticker set.
+    Slow path (~4s, every 5 min): full per-series discovery with nested markets.
+    """
+    global _discovery, _discovery_at
+
+    if _discovery and (time.time() - _discovery_at) < DISCOVERY_TTL_S:
+        raw = fetch_markets_by_tickers(list(_discovery))
+        markets = []
+        for ticker, m in raw.items():
+            if m.get("status") != "active":
+                continue
+            kind, city = _discovery[ticker]
+            mk = _market_from_dict(m, kind, city)
+            if mk is not None:
+                markets.append(mk)
+        if markets:
+            return markets
+        # batch refresh failed → fall through to full discovery
+
+    temp_series = _weather_series()
+    if not temp_series:
+        return []
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch_series_markets(item):
+        ticker, kind, city = item
+        out = []
+        data = _get_retry(f"{BASE_URL}/events",
+                          {"series_ticker": ticker, "status": "open",
+                           "limit": 10, "with_nested_markets": "true"})
+        if not data:
+            return out
+        for event in data.get("events", []):
+            for m in event.get("markets", []) or []:
+                if m.get("status") == "active":
+                    # nested markets sometimes omit event_ticker — backfill it
+                    m.setdefault("event_ticker", event.get("event_ticker", ""))
+                    out.append((m, kind, city))
+        return out
+
+    markets: list[Market] = []
+    seen: set[str] = set()
+    discovery: dict[str, tuple[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for group in ex.map(_fetch_series_markets, temp_series):
+            for m, kind, city in group:
+                mt = m.get("ticker", "")
+                if mt in seen:
                     continue
-                seen.add(m_ticker)
-                market = _market_from_dict(m, kind, city)
-                if market is not None:
-                    markets.append(market)
+                seen.add(mt)
+                discovery[mt] = (kind, city)
+                mk = _market_from_dict(m, kind, city)
+                if mk is not None:
+                    markets.append(mk)
 
+    if discovery:
+        _discovery, _discovery_at = discovery, time.time()
     return markets
+
+
+def fetch_markets_by_tickers(tickers: list[str]) -> dict[str, dict]:
+    """
+    Batch-fetch raw market dicts (incl. `result` / `status`) for specific
+    tickers in chunks of 100 — used by the resolver instead of one HTTP
+    round trip per pending bet.
+    """
+    out: dict[str, dict] = {}
+    for i in range(0, len(tickers), 100):
+        chunk = tickers[i:i + 100]
+        data = _get_retry(f"{BASE_URL}/markets",
+                          {"tickers": ",".join(chunk), "limit": len(chunk)})
+        for m in (data or {}).get("markets", []):
+            t = m.get("ticker")
+            if t:
+                out[t] = m
+    return out
+
+
+def kalshi_fee(price: float, contracts: int = 1) -> float:
+    """
+    Kalshi trading fee in dollars: ceil-to-cent of 0.07 · C · P · (1−P).
+    At 50¢ that's 1.75¢/contract — real money at our edge sizes, so the
+    analyzer nets it out of every edge and the P&L books it.
+    """
+    import math
+    if price <= 0 or price >= 1:
+        return 0.0
+    return math.ceil(7.0 * contracts * price * (1 - price)) / 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -362,12 +503,13 @@ def _sign(config: Any, method: str, path: str) -> dict:
     }
 
 
-def place_order(config: Any, ticker: str, side: str, count: int, price_cents: int) -> dict:
+def place_order(config: Any, ticker: str, side: str, count: int,
+                price_cents: int, action: str = "buy") -> dict:
     path    = "/trade-api/v2/portfolio/orders"
     headers = _sign(config, "POST", path)
     body    = {
         "ticker": ticker,
-        "action": "buy",
+        "action": action,          # "buy" to open, "sell" to close/exit
         "side":   side,
         "count":  count,
         "type":   "limit",
@@ -376,6 +518,37 @@ def place_order(config: Any, ticker: str, side: str, count: int, price_cents: in
     resp = requests.post(f"{ORDER_URL}/portfolio/orders", headers=headers, json=body, timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+def get_order(config: Any, order_id: str) -> dict:
+    """Fetch a single order's status (resting / executed / canceled)."""
+    path    = f"/trade-api/v2/portfolio/orders/{order_id}"
+    headers = _sign(config, "GET", path)
+    resp = requests.get(f"{ORDER_URL}/portfolio/orders/{order_id}", headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json().get("order", {})
+
+
+def cancel_order(config: Any, order_id: str) -> dict:
+    """Cancel a resting order."""
+    path    = f"/trade-api/v2/portfolio/orders/{order_id}"
+    headers = _sign(config, "DELETE", path)
+    resp = requests.delete(f"{ORDER_URL}/portfolio/orders/{order_id}", headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_position_count(config: Any, ticker: str) -> int:
+    """Return the number of contracts currently held for a market ticker."""
+    path    = "/trade-api/v2/portfolio/positions"
+    headers = _sign(config, "GET", path)
+    resp    = requests.get(f"{ORDER_URL}/portfolio/positions",
+                           headers=headers, params={"ticker": ticker}, timeout=15)
+    resp.raise_for_status()
+    for p in resp.json().get("market_positions", []):
+        if p.get("ticker") == ticker:
+            return abs(int(p.get("position", 0)))
+    return 0
 
 
 def get_token_id(market: Market, outcome: str) -> str:

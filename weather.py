@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -116,6 +116,56 @@ ICAO_COORDS: dict[str, tuple[float, float]] = {
     "VHHH": (22.3080, 114.1747),   # Hong Kong International (near HKO)
     "HKO":  (22.3119, 114.1742),   # Hong Kong Observatory (King's Park)
     "LTAC": (39.9455, 32.6882),    # Ankara Esenboğa
+    # US resolution stations (Kalshi CITY_TO_ICAO) — hardcoded so we never need
+    # an NWS /stations lookup, and so station_tz_offset() has real longitudes.
+    "KLAX": (33.9382, -118.3866),  # Los Angeles Intl
+    "KNYC": (40.7789, -73.9692),   # New York Central Park
+    "KORD": (41.9603, -87.9316),   # Chicago O'Hare
+    "KMIA": (25.7903, -80.3164),   # Miami Intl
+    "KDCA": (38.8483, -77.0342),   # Washington Reagan
+    "KATL": (33.6301, -84.4418),   # Atlanta Hartsfield
+    "KDEN": (39.8466, -104.6562),  # Denver Intl
+    "KSEA": (47.4444, -122.3138),  # Seattle-Tacoma
+    "KPHX": (33.4278, -112.0037),  # Phoenix Sky Harbor
+    "KPHL": (39.8683, -75.2311),   # Philadelphia Intl
+    "KSAT": (29.5443, -98.4839),   # San Antonio Intl
+    "KOKC": (35.3889, -97.6006),   # Oklahoma City Will Rogers
+    "KLAS": (36.0719, -115.1634),  # Las Vegas Harry Reid
+    "KBOS": (42.3606, -71.0097),   # Boston Logan
+    "KDFW": (32.8978, -97.0189),   # Dallas-Fort Worth
+    "KAUS": (30.1833, -97.6799),   # Austin-Bergstrom
+    "KSFO": (37.6197, -122.3647),  # San Francisco Intl
+    "KMSP": (44.8848, -93.2223),   # Minneapolis-St Paul
+    "KMSY": (29.9928, -90.2510),   # New Orleans Louis Armstrong
+    "KTPA": (27.9755, -82.5332),   # Tampa Intl
+    "KSAN": (32.7338, -117.1933),  # San Diego Intl
+    "KPDX": (45.5898, -122.5951),  # Portland Intl
+    "KBNA": (36.1188, -86.6892),   # Nashville Intl
+    "KSLC": (40.7884, -111.9778),  # Salt Lake City Intl
+    "KMCI": (39.2976, -94.7139),   # Kansas City Intl
+    "KSMF": (38.6954, -121.5908),  # Sacramento Intl
+    "KBWI": (39.1754, -76.6683),   # Baltimore-Washington
+    "KMKE": (42.9472, -87.8966),   # Milwaukee Mitchell
+    "KIND": (39.7173, -86.2944),   # Indianapolis Intl
+    "KCMH": (39.9980, -82.8919),   # Columbus John Glenn
+    "KCLT": (35.2140, -80.9431),   # Charlotte Douglas
+    "KMEM": (35.0424, -89.9767),   # Memphis Intl
+    "KSDF": (38.1740, -85.7365),   # Louisville Muhammad Ali
+    "KRDU": (35.8776, -78.7875),   # Raleigh-Durham
+    "KRIC": (37.5052, -77.3197),   # Richmond Intl
+    "KJAX": (30.4941, -81.6879),   # Jacksonville Intl
+    "KBDL": (41.9389, -72.6832),   # Hartford Bradley
+    "KBUF": (42.9405, -78.7322),   # Buffalo Niagara
+    "KPIT": (40.4915, -80.2329),   # Pittsburgh Intl
+    "KCLE": (41.4117, -81.8498),   # Cleveland Hopkins
+    "KDTW": (42.2124, -83.3534),   # Detroit Metro
+    "KELP": (31.8072, -106.3776),  # El Paso Intl
+    "KTUS": (32.1161, -110.9410),  # Tucson Intl
+    "KABQ": (35.0402, -106.6091),  # Albuquerque Sunport
+    "KOMA": (41.3032, -95.8941),   # Omaha Eppley
+    "KICT": (37.6499, -97.4331),   # Wichita Eisenhower
+    "KCOS": (38.8058, -104.7008),  # Colorado Springs
+    "KHOU": (29.6454, -95.2789),   # Houston Hobby
 }
 
 # (lat, lon, is_us) — is_us=True means NWS is available; False → Open-Meteo only
@@ -226,6 +276,8 @@ class DailyForecast:
     high_f_std: float = 4.0         # forecast uncertainty in °F
     low_f_std: float = 4.0
     sources_agree: bool = False      # True when NWS + Open-Meteo within 3°F
+    high_locked: bool = False        # intraday: high is past peak → near-certain
+    low_locked: bool = False         # intraday: low is past dawn → near-certain
     nws_high_f: Optional[float] = None
     om_high_f: Optional[float] = None
     nws_low_f: Optional[float] = None
@@ -244,7 +296,18 @@ def _find_city_coords(question: str) -> Optional[tuple[str, float, float, bool]]
     return best
 
 
+_geocode_cache: dict[str, Optional[tuple[float, float]]] = {}
+
+
 def _geocode(city_name: str) -> Optional[tuple[float, float]]:
+    if city_name in _geocode_cache:
+        return _geocode_cache[city_name]
+    result = _geocode_uncached(city_name)
+    _geocode_cache[city_name] = result
+    return result
+
+
+def _geocode_uncached(city_name: str) -> Optional[tuple[float, float]]:
     try:
         resp = requests.get(GEOCODE_URL, params={"name": city_name, "count": 1}, timeout=10)
         resp.raise_for_status()
@@ -256,16 +319,23 @@ def _geocode(city_name: str) -> Optional[tuple[float, float]]:
     return None
 
 
+# lat/lon → NWS gridpoint forecast URL (static mapping, cache forever)
+_nws_point_cache: dict[str, str] = {}
+
+
 def _nws_forecast(lat: float, lon: float, target_date: date) -> Optional[DailyForecast]:
     try:
-        point_resp = requests.get(
-            f"{NWS_URL}/points/{lat:.4f},{lon:.4f}",
-            headers={"User-Agent": "PolyBot/1.0 (weather-betting-bot)"},
-            timeout=10,
-        )
-        point_resp.raise_for_status()
-        props = point_resp.json()["properties"]
-        forecast_url = props["forecast"]
+        point_key = f"{lat:.4f},{lon:.4f}"
+        forecast_url = _nws_point_cache.get(point_key)
+        if not forecast_url:
+            point_resp = requests.get(
+                f"{NWS_URL}/points/{point_key}",
+                headers={"User-Agent": "PolyBot/1.0 (weather-betting-bot)"},
+                timeout=10,
+            )
+            point_resp.raise_for_status()
+            forecast_url = point_resp.json()["properties"]["forecast"]
+            _nws_point_cache[point_key] = forecast_url
 
         fc_resp = requests.get(
             forecast_url,
@@ -358,6 +428,180 @@ def _open_meteo_forecast(lat: float, lon: float, target_date: date) -> Optional[
     )
 
 
+def _open_meteo_hourly(lat: float, lon: float, target_date: date) -> Optional[list[tuple[int, float]]]:
+    """
+    Hourly temperature trajectory for target_date in LOCAL time.
+    Returns [(local_hour, temp_f), ...] — used to pinpoint the day's peak/trough
+    so we can narrow the intraday high/low estimate far tighter than a daily forecast.
+    """
+    try:
+        resp = requests.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat, "longitude": lon,
+                "hourly": "temperature_2m",
+                "temperature_unit": "fahrenheit",
+                "timezone": "auto",
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        hourly = resp.json().get("hourly", {})
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+    except Exception:
+        return None
+    out = []
+    for t, temp in zip(times, temps):
+        if temp is None:
+            continue
+        try:
+            hh = int(t[11:13])  # "2026-07-12T14:00" → 14
+        except Exception:
+            continue
+        out.append((hh, float(temp)))
+    return out or None
+
+
+@dataclass
+class IntradayEstimate:
+    """Tight intraday estimate that narrows as the day's observations come in."""
+    high_f: Optional[float]
+    high_std: float
+    low_f: Optional[float]
+    low_std: float
+    high_locked: bool     # observed high is past peak → near-certain
+    low_locked: bool      # observed low is past dawn trough → near-certain
+    note: str
+
+
+def intraday_estimate(
+    lat: float, lon: float, station_id: str, target_date: date, tz_off: int
+) -> Optional[IntradayEstimate]:
+    """
+    THE EDGE: combine observed high/low-so-far (METAR) with the hourly trajectory
+    to produce a time-decaying, much tighter estimate than a static daily forecast.
+
+    - Daily HIGH occurs ~mid-afternoon. Once we're past the projected peak and
+      cooling, the final high ≈ observed high (σ ≈ 1°F). Near-certain.
+    - Daily LOW occurs near dawn. After ~9am local it's essentially locked.
+    Only meaningful for same-day — in the STATION's timezone, not UTC's
+    (at 9pm in Vegas, UTC is already tomorrow).
+    """
+    local_today = (datetime.now(timezone.utc) + timedelta(hours=tz_off)).date()
+    if target_date != local_today:
+        return None
+
+    try:
+        from realtime import observed_range_today
+        obs = observed_range_today(station_id, tz_offset_hours=tz_off) if station_id else None
+    except Exception:
+        obs = None
+    hourly = _hourly_cached(lat, lon, target_date)
+    if obs is None and hourly is None:
+        return None
+
+    now = datetime.now(timezone.utc)
+    local_hour = (now.hour + tz_off) % 24
+    obs_low, obs_high = obs if obs else (None, None)
+
+    # ── HIGH ────────────────────────────────────────────────────────────
+    high_f = obs_high
+    high_std = 4.0
+    high_locked = False
+    if hourly:
+        remaining = [temp for (h, temp) in hourly if h >= local_hour]
+        proj_peak = max((t for _, t in hourly), default=None)          # today's modeled peak
+        peak_hour = max(hourly, key=lambda ht: ht[1])[0]               # when the model says it peaks
+        remaining_peak = max(remaining) if remaining else None
+        if obs_high is not None:
+            # final high ≥ what we've already seen
+            high_f = max(obs_high, remaining_peak) if remaining_peak is not None else obs_high
+            # past peak if nothing left in the day beats the observed high
+            past_peak = (remaining_peak is None) or (remaining_peak <= obs_high + 0.5)
+            if past_peak:
+                high_locked = True
+                high_std = 1.0
+            else:
+                # Confidence tightens as the day's ACTUAL modeled peak hour
+                # approaches (not a hardcoded 3pm) — near-lock bets get sharp
+                # σ earlier, before the market fully reprices.
+                hours_to_peak = max(0, peak_hour - local_hour)
+                high_std = min(3.5, 1.2 + 0.3 * hours_to_peak)
+                # Nearly there: remaining trajectory within 1°F of observed
+                if remaining_peak is not None and remaining_peak <= obs_high + 1.0:
+                    high_std = min(high_std, 1.5)
+        elif proj_peak is not None:
+            high_f = proj_peak
+            high_std = 3.0
+
+    # ── LOW ─────────────────────────────────────────────────────────────
+    low_f = obs_low
+    low_std = 4.0
+    low_locked = False
+    if obs_low is not None:
+        # The low is set near dawn; after ~9am local it's essentially final for the day
+        if local_hour >= 9:
+            low_locked = True
+            low_std = 1.0
+        else:
+            low_std = 2.5
+    elif hourly:
+        low_f = min((t for _, t in hourly), default=None)
+        low_std = 3.0
+
+    note = f"intraday @ {local_hour}h local"
+    if high_locked:
+        note += f", high locked ~{high_f:.0f}°F"
+    if low_locked:
+        note += f", low locked ~{low_f:.0f}°F"
+    return IntradayEstimate(high_f, high_std, low_f, low_std, high_locked, low_locked, note)
+
+
+def _met_norway_forecast(lat: float, lon: float, target_date: date) -> Optional[DailyForecast]:
+    """
+    Independent third source: MET Norway (Yr.no), which runs the ECMWF model —
+    genuinely independent from the GFS model NWS and Open-Meteo both use.
+    Free, no API key. Requires a descriptive User-Agent per their terms.
+    """
+    try:
+        resp = requests.get(
+            "https://api.met.no/weatherapi/locationforecast/2.0/compact",
+            params={"lat": round(lat, 4), "lon": round(lon, 4)},
+            headers={"User-Agent": "PolyBot/1.0 weather-betting-bot (contact: local)"},
+            timeout=12,
+        )
+        resp.raise_for_status()
+        series = resp.json()["properties"]["timeseries"]
+    except Exception:
+        return None
+
+    temps_c: list[float] = []
+    for entry in series:
+        t = entry.get("time", "")
+        try:
+            dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if dt.date() != target_date:
+            continue
+        c = entry.get("data", {}).get("instant", {}).get("details", {}).get("air_temperature")
+        if c is not None:
+            temps_c.append(float(c))
+
+    if not temps_c:
+        return None
+
+    high_f = max(temps_c) * 9 / 5 + 32
+    low_f = min(temps_c) * 9 / 5 + 32
+    return DailyForecast(
+        target_date=target_date, city="", high_f=round(high_f, 1),
+        low_f=round(low_f, 1), source="MET-Norway",
+    )
+
+
 def _open_meteo_ensemble(lat: float, lon: float, target_date: date) -> Optional[tuple[float, float, float, float]]:
     """
     Fetch GFS ensemble members from Open-Meteo to get realistic forecast spread.
@@ -415,13 +659,96 @@ def _estimate_snow_prob(description: str, precip_prob: float) -> float:
     return 0.0
 
 
-# In-memory cache: (city_key, target_date) → DailyForecast | None
-# Reset each scan by calling clear_forecast_cache()
-_forecast_cache: dict[tuple[str, date], Optional[DailyForecast]] = {}
+# In-memory TTL caches. Consensus (NWS/OM/MET/ensemble) forecasts update at
+# most hourly, so caching them 10 min across scans removes ~all forecast
+# network calls from a scan. The fast-moving intraday part (METAR observed
+# range) is re-applied FRESH on every get_forecast() call — it's served from
+# realtime.prefetch_stations()'s batch cache, so it costs nothing.
+CONSENSUS_TTL_S = 600
+HOURLY_TTL_S    = 900
+
+import threading
+
+# cache_key → (fetched_at_utc, DailyForecast | None)   [static consensus, no intraday]
+_forecast_cache: dict[str, tuple[datetime, Optional[DailyForecast]]] = {}
+# (lat,lon,date) → (fetched_at_utc, hourly trajectory)
+_hourly_cache: dict[tuple, tuple[datetime, Optional[list]]] = {}
+
+# Single-flight locks: 16 analyzer threads hit the same station+date key at
+# once on a cache miss; without per-key locking each of them rebuilt the whole
+# consensus (8 duplicate NWS calls for one station observed in profiling).
+_key_locks: dict[str, threading.Lock] = {}
+_key_locks_guard = threading.Lock()
+
+
+def _lock_for(key: str) -> threading.Lock:
+    with _key_locks_guard:
+        lock = _key_locks.get(key)
+        if lock is None:
+            lock = _key_locks[key] = threading.Lock()
+        return lock
+
+
+def _consensus_cached(cache_key: str, builder) -> Optional[DailyForecast]:
+    """TTL cache + single-flight: only one thread builds a missing key."""
+    hit, fc = _cache_get(cache_key)
+    if hit:
+        return fc
+    with _lock_for(cache_key):
+        hit, fc = _cache_get(cache_key)   # re-check under the lock
+        if hit:
+            return fc
+        fc = builder()
+        _cache_put(cache_key, fc)
+        return fc
 
 
 def clear_forecast_cache() -> None:
-    _forecast_cache.clear()
+    """Drop only EXPIRED entries. Fresh consensus forecasts survive scans."""
+    now = datetime.now(timezone.utc)
+    for k in [k for k, (ts, _) in _forecast_cache.items()
+              if (now - ts).total_seconds() > CONSENSUS_TTL_S]:
+        del _forecast_cache[k]
+    for k in [k for k, (ts, _) in _hourly_cache.items()
+              if (now - ts).total_seconds() > HOURLY_TTL_S]:
+        del _hourly_cache[k]
+
+
+def _cache_get(key: str) -> tuple[bool, Optional[DailyForecast]]:
+    hit = _forecast_cache.get(key)
+    if hit is None:
+        return False, None
+    ts, fc = hit
+    if (datetime.now(timezone.utc) - ts).total_seconds() > CONSENSUS_TTL_S:
+        return False, None
+    return True, fc
+
+
+def _cache_put(key: str, fc: Optional[DailyForecast]) -> None:
+    _forecast_cache[key] = (datetime.now(timezone.utc), fc)
+
+
+def _hourly_cached(lat: float, lon: float, target_date: date) -> Optional[list]:
+    key = (round(lat, 3), round(lon, 3), target_date)
+
+    def _fresh():
+        hit = _hourly_cache.get(key)
+        if hit is not None:
+            ts, val = hit
+            if (datetime.now(timezone.utc) - ts).total_seconds() <= HOURLY_TTL_S:
+                return True, val
+        return False, None
+
+    ok, val = _fresh()
+    if ok:
+        return val
+    with _lock_for(f"hourly:{key}"):
+        ok, val = _fresh()
+        if ok:
+            return val
+        val = _open_meteo_hourly(lat, lon, target_date)
+        _hourly_cache[key] = (datetime.now(timezone.utc), val)
+        return val
 
 
 def _station_to_coords(
@@ -494,78 +821,104 @@ def _station_to_coords(
 
 
 def _build_consensus_forecast(
-    lat: float, lon: float, is_us: bool, target_date: date, city_name: str
+    lat: float, lon: float, is_us: bool, target_date: date, city_name: str,
+    station_id: str = "",
 ) -> Optional[DailyForecast]:
     """
-    Fetch NWS (if US) and Open-Meteo, then build a consensus forecast.
+    Consensus across THREE independent forecasts plus observed reality:
+      - NWS         (GFS model, US only)
+      - Open-Meteo  (GFS model)
+      - MET Norway  (ECMWF model — independent of GFS, the real tiebreaker)
+    For same-day markets we also blend toward the OBSERVED trend (METAR), since
+    a morning forecast can lag a marine-layer stall the market already sees.
 
-    - If both sources agree within 3°F: use the average, tighten σ to ensemble spread
-    - If they disagree by 3-6°F: use the average, but widen σ to reflect disagreement
-    - If they disagree >6°F: flag sources_agree=False (analyzer will skip or be cautious)
-    - Also pulls GFS ensemble spread as the true uncertainty measure
+    Consensus = mean of available sources; σ = max(ensemble spread, source spread).
+    sources_agree = all sources within 3°F of each other.
     """
-    nws_fc: Optional[DailyForecast] = None
-    om_fc:  Optional[DailyForecast] = None
+    import statistics as _stats
+    from concurrent.futures import ThreadPoolExecutor
 
-    if is_us:
-        nws_fc = _nws_forecast(lat, lon, target_date)
-    om_fc = _open_meteo_forecast(lat, lon, target_date)
+    # Fetch all independent sources concurrently — 4 network calls in parallel
+    # instead of serial, cutting per-city forecast latency ~4x.
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_nws = ex.submit(_nws_forecast, lat, lon, target_date) if is_us else None
+        f_om  = ex.submit(_open_meteo_forecast, lat, lon, target_date)
+        f_met = ex.submit(_met_norway_forecast, lat, lon, target_date)
+        f_ens = ex.submit(_open_meteo_ensemble, lat, lon, target_date)
+        nws_fc   = f_nws.result() if f_nws else None
+        om_fc    = f_om.result()
+        met_fc   = f_met.result()
+        ensemble = f_ens.result()
 
-    # Try ensemble spread for σ calibration
-    ensemble = _open_meteo_ensemble(lat, lon, target_date)
-
-    # Determine best high/low estimate
-    if nws_fc and om_fc:
-        # Both available — compute agreement
-        high_diff = abs((nws_fc.high_f or 0) - (om_fc.high_f or 0))
-        low_diff  = abs((nws_fc.low_f  or 0) - (om_fc.low_f  or 0))
-        agrees    = high_diff <= 3.0 and low_diff <= 3.0
-
-        # Consensus = average of both
-        high_f = ((nws_fc.high_f or 0) + (om_fc.high_f or 0)) / 2 if (nws_fc.high_f and om_fc.high_f) else (nws_fc.high_f or om_fc.high_f)
-        low_f  = ((nws_fc.low_f  or 0) + (om_fc.low_f  or 0)) / 2 if (nws_fc.low_f  and om_fc.low_f ) else (nws_fc.low_f  or om_fc.low_f)
-
-        # σ: prefer ensemble spread, fall back to source disagreement, floor at 2°F
-        if ensemble:
-            high_std = max(ensemble[1], high_diff / 2, 2.0)
-            low_std  = max(ensemble[3], low_diff  / 2, 2.0)
-        else:
-            high_std = max(high_diff / 2 + 2.0, 3.0)
-            low_std  = max(low_diff  / 2 + 2.0, 3.0)
-
-        source = "NWS+OM"
-    elif nws_fc:
-        high_f, low_f = nws_fc.high_f, nws_fc.low_f
-        high_std = ensemble[1] if ensemble else 4.0
-        low_std  = ensemble[3] if ensemble else 4.0
-        agrees   = False  # single source — can't confirm
-        source   = "NWS"
-    elif om_fc:
-        high_f, low_f = om_fc.high_f, om_fc.low_f
-        high_std = ensemble[1] if ensemble else 4.0
-        low_std  = ensemble[3] if ensemble else 4.0
-        agrees   = False
-        source   = "Open-Meteo"
-    else:
+    highs = [f.high_f for f in (nws_fc, om_fc, met_fc) if f and f.high_f is not None]
+    lows  = [f.low_f  for f in (nws_fc, om_fc, met_fc) if f and f.low_f  is not None]
+    if not highs and not lows:
         return None
 
+    high_f = sum(highs) / len(highs) if highs else None
+    low_f  = sum(lows) / len(lows) if lows else None
+
+    # Spread across the independent sources (how much they disagree)
+    high_spread = (max(highs) - min(highs)) if len(highs) > 1 else 0.0
+    low_spread  = (max(lows) - min(lows)) if len(lows) > 1 else 0.0
+    try:
+        from config import Config as _C
+        _band = _C().agreement_band_f
+    except Exception:
+        _band = 4.5
+    agrees = (high_spread <= _band) and (low_spread <= _band)
+
+    # σ: widen with both ensemble spread and source disagreement, floor at 2°F
+    high_std = max(ensemble[1] if ensemble else 3.0, high_spread / 2, 2.0)
+    low_std  = max(ensemble[3] if ensemble else 3.0, low_spread / 2, 2.0)
+
+    n = sum(1 for f in (nws_fc, om_fc, met_fc) if f)
+    source = f"{n}-source"
+
     return DailyForecast(
-        target_date=target_date,
-        city=city_name,
-        high_f=high_f,
-        low_f=low_f,
+        target_date=target_date, city=city_name,
+        high_f=high_f, low_f=low_f,
         precip_prob=(nws_fc or om_fc).precip_prob if (nws_fc or om_fc) else 0.0,
         snow_prob=(nws_fc or om_fc).snow_prob if (nws_fc or om_fc) else 0.0,
         description=nws_fc.description if nws_fc else "",
         source=source,
-        high_f_std=high_std,
-        low_f_std=low_std,
+        high_f_std=high_std, low_f_std=low_std,
         sources_agree=agrees,
+        high_locked=False, low_locked=False,
         nws_high_f=nws_fc.high_f if nws_fc else None,
         om_high_f=om_fc.high_f   if om_fc  else None,
         nws_low_f=nws_fc.low_f   if nws_fc else None,
         om_low_f=om_fc.low_f     if om_fc  else None,
     )
+
+
+def _apply_intraday(
+    fc: DailyForecast, lat: float, lon: float, station_id: str, target_date: date
+) -> DailyForecast:
+    """
+    ── INTRADAY OVERRIDE (same-day) — THE EDGE ─────────────────────────────
+    Overlay the tight observed-narrowing estimate on a (possibly cached) static
+    consensus for markets resolving today. Returns a NEW DailyForecast so the
+    cached consensus object is never mutated. Cheap: observed data comes from
+    the batched METAR prefetch, hourly trajectory from a 15-min cache.
+    """
+    import dataclasses
+    fresh = dataclasses.replace(fc)
+    tz_off = round(lon / 15.0)
+    local_today = (datetime.now(timezone.utc) + timedelta(hours=tz_off)).date()
+    if not station_id or target_date != local_today:
+        return fresh
+    intra = intraday_estimate(lat, lon, station_id, target_date, tz_off)
+    if not intra:
+        return fresh
+    if intra.high_f is not None:
+        fresh.high_f, fresh.high_f_std, fresh.high_locked = intra.high_f, intra.high_std, intra.high_locked
+    if intra.low_f is not None:
+        fresh.low_f, fresh.low_f_std, fresh.low_locked = intra.low_f, intra.low_std, intra.low_locked
+    fresh.description = (fc.description or "") + f" | {intra.note}"
+    fresh.source = fc.source + "+intraday"
+    fresh.sources_agree = True   # observed reality is our best estimate, treat as agreed
+    return fresh
 
 
 def get_forecast(
@@ -593,8 +946,12 @@ def get_forecast(
         if station_result:
             lat, lon, is_us = station_result
             # Extract station ID for cache key
-            sm = _WU_STATION_RE.search(resolution_source)
-            station_id = sm.group(1) if sm else resolution_source
+            bare = resolution_source.strip().upper()
+            if re.match(r'^[A-Z]{3,5}$', bare):
+                station_id = bare
+            else:
+                sm = _WU_STATION_RE.search(resolution_source)
+                station_id = sm.group(1) if sm else resolution_source
             cache_key = f"station:{station_id}:{target_date}"
             city_name = station_id  # will be overwritten below if city found
 
@@ -603,12 +960,13 @@ def get_forecast(
             if city_match:
                 city_name = city_match[0]
 
-            if cache_key in _forecast_cache:
-                return _forecast_cache[cache_key]
-
-            forecast = _build_consensus_forecast(lat, lon, is_us, target_date, city_name)
-            _forecast_cache[cache_key] = forecast
-            return forecast
+            forecast = _consensus_cached(
+                cache_key,
+                lambda: _build_consensus_forecast(lat, lon, is_us, target_date, city_name, station_id),
+            )
+            if forecast is None:
+                return None
+            return _apply_intraday(forecast, lat, lon, station_id, target_date)
 
     # 2. Fall back to city name lookup
     match = _find_city_coords(question)
@@ -625,15 +983,17 @@ def get_forecast(
         is_us = False
 
     cache_key = f"city:{city_name.lower()}:{target_date}"
-    if cache_key in _forecast_cache:
-        return _forecast_cache[cache_key]
 
-    forecast = _build_consensus_forecast(lat, lon, is_us, target_date, city_name)
-    if forecast:
-        forecast.city = city_name
+    def _build_city():
+        fc = _build_consensus_forecast(lat, lon, is_us, target_date, city_name)
+        if fc:
+            fc.city = city_name
+        return fc
 
-    _forecast_cache[cache_key] = forecast
-    return forecast
+    forecast = _consensus_cached(cache_key, _build_city)
+    if forecast is None:
+        return None
+    return _apply_intraday(forecast, lat, lon, "", target_date)
 
 
 def _extract_city_heuristic(question: str) -> str:

@@ -84,38 +84,45 @@
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  /* PolyBot trading-terminal theme (committed dark) */
+  --background: #0a0d14;
+  --foreground: #e7ebf3;
+  --card: #11151d;
+  --card-foreground: #e7ebf3;
+  --popover: #151a24;
+  --popover-foreground: #e7ebf3;
+  --primary: #3987e5;
+  --primary-foreground: #ffffff;
+  --secondary: #1a202c;
+  --secondary-foreground: #e7ebf3;
+  --muted: #1a202c;
+  --muted-foreground: #8b93a7;
+  --accent: #1a202c;
+  --accent-foreground: #e7ebf3;
+  --destructive: #d03b3b;
+  --border: oklch(1 0 0 / 8%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: #3987e5;
+  /* validated chart slots (dark surface #11151d) */
+  --chart-1: #3987e5;   /* series blue */
+  --chart-2: #0ca30c;   /* profit / good */
+  --chart-3: #d03b3b;   /* loss / critical */
+  --chart-4: #c98500;   /* pending / caution */
+  --chart-5: #9085e9;   /* violet accent */
+  --pb-grid: #232a37;   /* hairline gridline */
+  --pb-axis: #3a4353;
+  --sidebar: #11151d;
+  --sidebar-foreground: #e7ebf3;
+  --sidebar-primary: #3987e5;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #1a202c;
+  --sidebar-accent-foreground: #e7ebf3;
+  --sidebar-border: oklch(1 0 0 / 8%);
+  --sidebar-ring: #3987e5;
 }
+
+/* Tabular figures for anything that must align in columns */
+.tnum { font-variant-numeric: tabular-nums; }
 
 @layer base {
   * {

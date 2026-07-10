@@ -1,140 +1,119 @@
 "use client";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { cents, usd, pct, pnlClass, parseQuestion, timeAgo } from "@/lib/format";
+import StrategyBadge from "./StrategyBadge";
 
-function fmtTemp(f: number | null | undefined, q: string) {
-  if (f == null) return "—";
-  const isC = q?.includes("°C");
-  return isC ? `${((f - 32) * 5 / 9).toFixed(1)}°C` : `${f.toFixed(0)}°F`;
+interface Props {
+  posMap: Record<string, any>;
+  marks: Record<string, any>;
 }
 
-function winStatus(pos: any, signals: any[]) {
-  const q       = pos.question ?? "";
-  const isLow   = q.toLowerCase().includes("lowest");
-  const isC     = q.includes("°C");
-  const outcome = pos.outcome;
-
-  // Find latest forecast for this market
-  const sig = signals.find(
-    (s: any) => s.market_id === pos.market_id || s.question === pos.question
+export default function Positions({ posMap, marks }: Props) {
+  const entries = Object.entries(posMap).sort(
+    ([, a], [, b]) => (b.opened_at ?? "").localeCompare(a.opened_at ?? "")
   );
-  const fc_val_f = sig ? (isLow ? sig.forecast_low_f : sig.forecast_high_f) : null;
-  if (fc_val_f == null) return null;
 
-  const fc = isC ? (fc_val_f - 32) * 5 / 9 : fc_val_f;
-
-  // Extract bucket temps (only temperature numbers)
-  const bucket = q.toLowerCase().includes(" be ")
-    ? q.slice(q.toLowerCase().indexOf(" be ") + 4).replace(/ on .+/, "")
-    : "";
-  const nums = [...bucket.matchAll(/([\d.]+)\s*°/g)].map(m => parseFloat(m[1]));
-  if (!nums.length) return null;
-
-  const lo = nums[0], hi = nums[nums.length - 1];
-  let inBucket: boolean;
-
-  if (bucket.includes("or higher") || bucket.includes("or above")) {
-    inBucket = fc >= lo;
-  } else if (bucket.includes("or below") || bucket.includes("<")) {
-    inBucket = fc <= hi;
-  } else {
-    inBucket = fc >= lo - 1 && fc <= hi + 1;
+  if (!entries.length) {
+    return (
+      <div className="rounded-xl ring-1 ring-border bg-card p-6 text-center text-sm text-muted-foreground">
+        No open positions — the bot is waiting for a real edge.
+      </div>
+    );
   }
 
-  const winning = outcome === "YES" ? inBucket : !inBucket;
-  return winning;
-}
-
-export default function Positions({ posMap, signals }: { posMap: Record<string, any>; signals: any[] }) {
-  const positions = Object.entries(posMap);
-
   return (
-    <div className="flex flex-col gap-3">
-      <h2 className="text-xs uppercase tracking-widest text-slate-500 font-semibold px-1">
-        Open Positions <span className="text-slate-600">({positions.length})</span>
-      </h2>
-
-      {positions.length === 0 && (
-        <div className="text-slate-600 text-sm text-center py-8 border border-slate-800 rounded-lg">
-          No open positions
-        </div>
-      )}
-
-      {positions.map(([id, pos]) => {
-        const q        = pos.question ?? "";
-        const isLow    = q.toLowerCase().includes("lowest");
-        const isC      = q.includes("°C");
-        const city     = q.match(/in (.+?) be /i)?.[1] ?? "";
-        const bucket   = q.toLowerCase().includes(" be ")
-          ? q.slice(q.toLowerCase().indexOf(" be ") + 4).replace(/\?.*/, "").replace(/ on .+/, "").trim()
-          : q.slice(0, 45);
-        const sig      = signals.find((s: any) => s.market_id === id || s.question === q);
-        const fc_val_f = sig ? (isLow ? sig.forecast_low_f : sig.forecast_high_f) : null;
-        const live_f   = sig?.metar_temp_f;
-        const targetDate = pos.target_date;
-        const isToday  = targetDate === new Date().toISOString().slice(0, 10);
-        const winning  = winStatus(pos, signals);
+    <div className="flex flex-col gap-2.5">
+      {entries.map(([id, p]) => {
+        const q = parseQuestion(p.question ?? "");
+        const mark = marks?.[id];
+        const cur = mark?.current_price ?? p.cur_price ?? null;
+        const sellNow = mark?.sell_now_price ?? null;
+        const wideSpread = cur != null && sellNow != null && cur - sellNow >= 0.02;
+        const upnl = mark?.unrealized_pnl ?? p.cur_unrealized_pnl ?? null;
+        const entry = p.market_price ?? 0;
+        const gainPct = cur != null && entry > 0 ? cur / entry - 1 : null;
+        const yes = p.outcome === "YES";
+        const prob = p.cur_our_prob ?? null;
+        const breaches = p.stop_breaches ?? 0;
+        // progress of current price toward $1 payoff
+        const progress = cur != null ? Math.max(0, Math.min(1, cur)) : entry;
 
         return (
-          <Card key={id} className="bg-[#141824] border-slate-800">
-            <CardHeader className="pb-2 pt-3 px-4">
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-slate-400 font-medium">{city}</span>
-                    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${
-                      isLow
-                        ? "bg-blue-500/15 text-blue-400"
-                        : "bg-orange-500/15 text-orange-400"
-                    }`}>
-                      {isLow ? "↓ LOW" : "↑ HIGH"}
-                    </span>
-                  </div>
-                  <div className="text-xs text-slate-500 mt-0.5 leading-tight">{bucket}</div>
+          <div key={id} className="rounded-xl ring-1 ring-border bg-card p-3">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[13px] font-semibold capitalize truncate">
+                  {q.city} <span className="text-muted-foreground font-normal">{q.kind}</span>{" "}
+                  {q.bucket}
                 </div>
-                <div className="flex flex-col items-end gap-1 shrink-0">
-                  <Badge variant="outline" className={
-                    pos.outcome === "YES"
-                      ? "border-emerald-500/40 text-emerald-400 bg-emerald-500/10 text-xs"
-                      : "border-red-500/40 text-red-400 bg-red-500/10 text-xs"
-                  }>
-                    {pos.outcome === "YES" ? "▲ YES" : "▼ NO"}
-                  </Badge>
-                  {winning !== null && (
-                    <span className={`text-[10px] font-bold ${winning ? "text-emerald-400" : "text-red-400"}`}>
-                      {winning ? "● WINNING" : "● LOSING"}
-                    </span>
-                  )}
+                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground mt-0.5">
+                  <StrategyBadge strategy={p.strategy} />
+                  <span>
+                    {q.date} · opened {timeAgo(p.opened_at)}
+                  </span>
                 </div>
               </div>
-            </CardHeader>
-            <CardContent className="px-4 pb-3">
-              <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
-                <Stat label="Entry" value={`${((pos.market_price ?? 0) * 100).toFixed(1)}¢`} />
-                <Stat label="Stake" value={`$${pos.stake_usdc ?? pos.stake ?? 0}`} />
-                {isToday && live_f != null ? (
-                  <Stat label="Live Now" value={fmtTemp(live_f, q)} color="text-emerald-400" />
-                ) : (
-                  <Stat label={`Fcst ${isLow ? "Low" : "High"}`} value={fmtTemp(fc_val_f, q)} />
+              <span
+                className={`shrink-0 inline-flex px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                  yes
+                    ? "bg-[#0ca30c]/15 text-[#2fc32f] ring-1 ring-[#0ca30c]/30"
+                    : "bg-[#d03b3b]/15 text-[#e05252] ring-1 ring-[#d03b3b]/30"
+                }`}
+              >
+                {p.outcome}
+              </span>
+            </div>
+
+            <div className="mt-2.5 flex items-center justify-between text-xs tnum">
+              <span className="text-muted-foreground">
+                {cents(entry)} →{" "}
+                <b
+                  className="text-foreground cursor-help"
+                  title={`fair value (mid). Full book: bid ${cents(sellNow)} · mid ${cents(cur)} · ask ${cents(mark?.ask_price)} · last trade ${cents(mark?.last_price)} (Kalshi's site shows the last trade)`}
+                >
+                  {cents(cur)}
+                </b>
+                {gainPct != null && (
+                  <span className={`ml-1 ${pnlClass(gainPct)}`}>{pct(gainPct, true)}</span>
                 )}
-                {isToday && fc_val_f != null && (
-                  <Stat label="Fcst" value={fmtTemp(fc_val_f, q)} />
+                {wideSpread && (
+                  <span
+                    className="ml-1.5 text-[#e5a940]"
+                    title="Wide bid-ask spread — an instant sale would fill at the bid, below fair value"
+                  >
+                    · sell now {cents(sellNow)}
+                  </span>
                 )}
-                <Stat label="Resolves" value={targetDate ? new Date(targetDate + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "—"} />
-              </div>
-            </CardContent>
-          </Card>
+              </span>
+              <span className={`font-bold ${pnlClass(upnl)}`}>{usd(upnl, true)}</span>
+            </div>
+
+            {/* entry → payout progress */}
+            <div
+              className="mt-1.5 h-1.5 rounded-full bg-secondary overflow-hidden"
+              title={`current price ${cents(cur)} of 100¢ payout`}
+            >
+              <div
+                className={`h-full rounded-full ${
+                  gainPct != null && gainPct < 0 ? "bg-[#d03b3b]" : "bg-[#0ca30c]"
+                }`}
+                style={{ width: `${progress * 100}%` }}
+              />
+            </div>
+
+            <div className="mt-2 flex items-center justify-between text-[11px] text-muted-foreground">
+              <span className="tnum">
+                stake ${(p.stake_usdc ?? 0).toFixed(0)}
+                {prob != null && <> · model {pct(prob)} win</>}
+              </span>
+              {breaches > 0 && (
+                <span className="text-[#e5a940] font-semibold">
+                  ⚠ stop watch {breaches}
+                </span>
+              )}
+            </div>
+          </div>
         );
       })}
-    </div>
-  );
-}
-
-function Stat({ label, value, color }: { label: string; value: string; color?: string }) {
-  return (
-    <div>
-      <div className="text-[10px] text-slate-500 uppercase tracking-wider">{label}</div>
-      <div className={`font-medium text-slate-200 ${color ?? ""}`}>{value}</div>
     </div>
   );
 }
