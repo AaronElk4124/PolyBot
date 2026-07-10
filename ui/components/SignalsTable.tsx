@@ -109,7 +109,13 @@ export default function SignalsTable({ signals }: { signals: any[] }) {
                 <TableCell className="font-medium text-slate-100 whitespace-nowrap">{city}</TableCell>
                 <TableCell className="text-slate-300 text-xs max-w-[180px] truncate">{bucket}</TableCell>
                 <TableCell>
-                  <span className="text-xs text-slate-400">{isLow ? "↓ Low" : "↑ High"}</span>
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
+                    isLow
+                      ? "bg-blue-500/15 text-blue-400"
+                      : "bg-orange-500/15 text-orange-400"
+                  }`}>
+                    {isLow ? "↓ LOW" : "↑ HIGH"}
+                  </span>
                 </TableCell>
                 <TableCell>
                   <Badge variant="outline" className={

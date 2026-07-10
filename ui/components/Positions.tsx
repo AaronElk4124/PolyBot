@@ -80,7 +80,16 @@ export default function Positions({ posMap, signals }: { posMap: Record<string, 
             <CardHeader className="pb-2 pt-3 px-4">
               <div className="flex items-start justify-between gap-2">
                 <div className="flex-1 min-w-0">
-                  <div className="text-xs text-slate-400 font-medium">{city}</div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-slate-400 font-medium">{city}</span>
+                    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${
+                      isLow
+                        ? "bg-blue-500/15 text-blue-400"
+                        : "bg-orange-500/15 text-orange-400"
+                    }`}>
+                      {isLow ? "↓ LOW" : "↑ HIGH"}
+                    </span>
+                  </div>
                   <div className="text-xs text-slate-500 mt-0.5 leading-tight">{bucket}</div>
                 </div>
                 <div className="flex flex-col items-end gap-1 shrink-0">

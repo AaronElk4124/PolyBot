@@ -34,9 +34,29 @@ TEMP_FORECAST_STD_C = TEMP_FORECAST_STD_F * 5 / 9
 # Minimum $ volume on a Kalshi market to consider it liquid enough to trade
 MIN_MARKET_VOLUME = 200.0
 
-# If sources disagree by more than this (°F), widen σ but still trade
-# If they disagree AND we require agreement, skip entirely
+# Require NWS + Open-Meteo consensus
 REQUIRE_SOURCE_AGREEMENT = True
+
+# Coastal/marine-layer stations where GFS-based models share a systematic bias.
+# NWS and Open-Meteo will always "agree" here because they use the same GFS input,
+# so apparent consensus is not independent confirmation.
+# These stations get wider σ (6°F) and higher edge threshold (1.5x normal).
+COASTAL_STATIONS = {
+    "KLAX",  # Los Angeles — strong marine layer Jun-Sep
+    "KSFO",  # San Francisco — marine layer year-round
+    "KSEA",  # Seattle — marine influence, stratus
+    "KBOS",  # Boston — sea breeze, coastal fog
+    "KNYC",  # New York — sea breeze moderates inland forecasts
+    "KLGA",  # LaGuardia — same
+    "KJFK",  # JFK — same
+    "KBWI",  # Baltimore — Chesapeake influence
+    "KMIA",  # Miami — sea breeze dominates afternoons
+    "KFLL",  # Fort Lauderdale
+    "KSAN",  # San Diego — strong marine layer
+    "KPDX",  # Portland — marine influence
+}
+COASTAL_STD_F   = 6.0   # wider σ for coastal stations
+COASTAL_EDGE_MULT = 1.5  # require 50% more edge at coastal stations
 
 
 @dataclass
@@ -319,6 +339,13 @@ def analyze_market(
     station_id = station_id_from_source(market.resolution_source, market.description)
     metar: Optional[StationReading] = fetch_metar(station_id) if station_id else None
 
+    # Coastal stations share a systematic GFS bias (marine layer). Widen σ so our
+    # confidence reflects that NWS+Open-Meteo agreement is not independent here.
+    is_coastal = station_id in COASTAL_STATIONS
+    if is_coastal:
+        forecast.high_f_std = max(forecast.high_f_std, COASTAL_STD_F)
+        forecast.low_f_std  = max(forecast.low_f_std,  COASTAL_STD_F)
+
     our_prob: Optional[float] = None
     reason: str = ""
     metar_override = False
@@ -372,12 +399,37 @@ def analyze_market(
     yes_edge = our_prob - market.yes_price
     no_edge = (1.0 - our_prob) - market.no_price
 
-    if yes_edge >= edge_threshold:
+    # Rounding buffer: NWS Climatological Report rounds to the nearest integer °F.
+    # If the forecast sits within 1°F of a bucket boundary, the actual reported
+    # value could round into or out of that bucket. Require extra edge to compensate.
+    if bucket:
+        fc_val = (forecast.high_f if bucket.is_high else forecast.low_f) or 0
+        fc_native = (fc_val - 32) * 5/9 if bucket.unit == "C" else fc_val
+        lo = bucket.lo or 0
+        hi = bucket.hi or 999
+        # Is the forecast within 1°F of either edge of the bucket?
+        near_boundary = (abs(fc_native - lo) < 1.0 or abs(fc_native - hi) < 1.0)
+        if near_boundary:
+            # Double the required edge — don't bet on rounding coin flips
+            effective_threshold = edge_threshold * 2
+            reason += f" | ⚠️ forecast near bucket boundary, requiring {effective_threshold:.0%} edge"
+        else:
+            effective_threshold = edge_threshold
+    else:
+        effective_threshold = edge_threshold
+
+    # Coastal stations: require extra edge because our two forecast sources are
+    # correlated (shared GFS model) and miss marine-layer effects (see AccuWeather divergence).
+    if is_coastal:
+        effective_threshold *= COASTAL_EDGE_MULT
+        reason += f" | 🌊 coastal station, edge req ×{COASTAL_EDGE_MULT}"
+
+    if yes_edge >= effective_threshold:
         outcome = "YES"
         market_price = market.yes_price
         edge = yes_edge
         prob_for_kelly = our_prob
-    elif no_edge >= edge_threshold:
+    elif no_edge >= effective_threshold:
         outcome = "NO"
         market_price = market.no_price
         edge = no_edge

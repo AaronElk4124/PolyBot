@@ -9,9 +9,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
 export default function Dashboard() {
-  const { data: scan }     = useSWR("/api/scan",      fetcher, { refreshInterval: 10_000 });
-  const { data: positions} = useSWR("/api/positions", fetcher, { refreshInterval: 10_000 });
-  const { data: history }  = useSWR("/api/history",   fetcher, { refreshInterval: 30_000 });
+  const { data: scan }     = useSWR("/api/scan",      fetcher, { refreshInterval: 5_000 });
+  const { data: positions} = useSWR("/api/positions", fetcher, { refreshInterval: 5_000 });
+  const { data: history }  = useSWR("/api/history",   fetcher, { refreshInterval: 5_000 });
 
   const signals  = scan?.signals   ?? [];
   const posMap   = positions        ?? {};
