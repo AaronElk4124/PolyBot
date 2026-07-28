@@ -43,7 +43,7 @@ class Config:
     min_entry_price:    float = float(os.getenv("MIN_ENTRY_PRICE", "0.45"))
     # Only bet NO when the forecast is this many °F clear of the bucket — high
     # conviction that survives forecast error (avoids coin-flip NO losses).
-    conviction_margin_f: float = float(os.getenv("CONVICTION_MARGIN_F", "3.0"))
+    conviction_margin_f: float = float(os.getenv("CONVICTION_MARGIN_F", "3.5"))
     # ── Regime awareness ────────────────────────────────────────────────
     # Same-day intraday = our real edge (observed narrowing + repricing lag).
     # Next-day = efficient market, no edge. So bet next-day rarely + only on
@@ -60,7 +60,7 @@ class Config:
     # -$400. When on, momentum may ONLY waive the minimum-edge gate — never the
     # price floor, liquidity, or forecast-direction gates.
     momentum_scalp:     bool  = os.getenv("MOMENTUM_SCALP", "false").lower() == "true"
-    momentum_threshold: float = float(os.getenv("MOMENTUM_THRESHOLD", "0.03"))       # +3¢ move triggers a scalp
+    momentum_threshold: float = float(os.getenv("MOMENTUM_THRESHOLD", "0.04"))       # +4¢ move triggers a scalp
     # How closely the independent forecast sources must agree (°F) to place a bet.
     # 3 independent models (NWS/Open-Meteo/MET Norway) naturally spread wider than 2.
     agreement_band_f:   float = float(os.getenv("AGREEMENT_BAND_F", "4.5"))
